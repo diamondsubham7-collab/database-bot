@@ -1,0 +1,12 @@
+EmployeeID,Name,Department,Designation,Phone,Email,Salary
+
+EMP001,Rahul Kumar,IT,Developer,9876543210,rahul@gmail.com,45000
+EMP002,Priya Sharma,HR,HR Executive,9876543211,priya@gmail.com,40000
+EMP003,Amit Das,Finance,Accountant,9876543212,amit@gmail.com,42000
+EMP004,Sneha Patel,Marketing,Manager,9876543213,sneha@gmail.com,55000
+EMP005,Rakesh Singh,Operations,Supervisor,9876543214,rakesh@gmail.com,38000
+EMP006,Anjali Verma,IT,Tester,9876543215,anjali@gmail.com,43000
+EMP007,Vikash Sahu,Sales,Sales Executive,9876543216,vikash@gmail.com,39000
+EMP008,Pooja Das,HR,Recruiter,9876543217,pooja@gmail.com,41000
+EMP009,Sumit Nayak,IT,Team Lead,9876543218,sumit@gmail.com,65000
+EMP010,Neha Panda,Finance,Senior Accountant,9876543219,neha@gmail.com,52000
