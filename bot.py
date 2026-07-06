@@ -5,8 +5,6 @@ from openpyxl.styles import Font, PatternFill, Alignment
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from dotenv import load_dotenv
-import pytesseract
-from PIL import Image
 import re
 import zipfile
 import io
@@ -21,7 +19,6 @@ TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 os.makedirs("received_files", exist_ok=True)
 
-# ---- Database Setup ----
 DB_PATH = "database.db"
 
 def init_db():
@@ -63,10 +60,6 @@ def log_action_sync(user_id, username, first_name, last_name, command, details="
     except Exception as e:
         print(f"DB Error: {e}")
 
-# ---- Tesseract Path ----
-pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-
-# ---- Helper Functions ----
 def beautify_excel(filepath, freeze_panes=False, auto_filter=False, alt_rows=False):
     try:
         wb = load_workbook(filepath)
@@ -114,55 +107,6 @@ def convert_to_excel(input_path, output_path=None):
         print(f"Conversion error: {e}")
         raise
     return output_path
-
-def ocr_image_to_excel(image_path, output_path=None):
-    if output_path is None:
-        output_path = os.path.splitext(image_path)[0] + ".xlsx"
-    try:
-        img = Image.open(image_path)
-        text = pytesseract.image_to_string(img)
-        if not text.strip():
-            raise ValueError("No text detected in image")
-        lines = [line.strip() for line in text.split('\n') if line.strip()]
-        records = []
-        current_record = {}
-        for line in lines:
-            if ':' in line:
-                parts = line.split(':', 1)
-                key = parts[0].strip()
-                value = parts[1].strip()
-                if key == "Employee ID" and current_record:
-                    records.append(current_record)
-                    current_record = {}
-                current_record[key] = value
-        if current_record:
-            records.append(current_record)
-        if records:
-            headers = list(records[0].keys())
-            data = []
-            for rec in records:
-                row = [rec.get(h, '') for h in headers]
-                data.append(row)
-            df = pd.DataFrame(data, columns=headers)
-            df.to_excel(output_path, index=False, engine='openpyxl')
-            beautify_excel(output_path, freeze_panes=True, auto_filter=True, alt_rows=True)
-            return output_path
-        rows = []
-        for line in lines:
-            row = line.split()
-            if row:
-                rows.append(row)
-        if rows:
-            headers = rows[0]
-            data = rows[1:] if len(rows) > 1 else []
-            df = pd.DataFrame(data, columns=headers)
-            df.to_excel(output_path, index=False, engine='openpyxl')
-            beautify_excel(output_path, freeze_panes=True, auto_filter=True, alt_rows=True)
-            return output_path
-        raise ValueError("Could not parse text into table format")
-    except Exception as e:
-        print(f"OCR Error: {e}")
-        raise
 
 def pdf_to_excel(pdf_path, output_path=None):
     if output_path is None:
@@ -244,39 +188,17 @@ def pdf_to_excel(pdf_path, output_path=None):
         print(f"PDF Error: {e}")
         raise
 
-# ---- Logging Wrapper ----
-def log_command(command_name, details=""):
-    def decorator(func):
-        async def wrapper(update, context, *args, **kwargs):
-            try:
-                user = update.effective_user
-                log_action_sync(
-                    user.id,
-                    user.username or "",
-                    user.first_name or "",
-                    user.last_name or "",
-                    command_name,
-                    details
-                )
-            except:
-                pass
-            return await func(update, context, *args, **kwargs)
-        return wrapper
-    return decorator
-
 # ---- Bot Commands ----
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "/start", "User started bot")
-    
     await update.message.reply_text(
         "📂 **Database Bot Ready!**\n\n"
         "📤 **Upload:**\n"
         "• TXT/CSV → Convert & Store\n"
         "• Excel → Store Directly\n"
         "• PDF → Extract & Convert to Excel\n"
-        "• ZIP → Extract & Merge All (Auto)\n"
-        "• Photo → OCR to Excel (with /xlsx)\n\n"
+        "• ZIP → Extract & Merge All (Auto)\n\n"
         "⚙️ **Commands:**\n"
         "/xlsx → Convert (No Store)\n"
         "/preview → Show Stored Files\n"
@@ -312,7 +234,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_xlsx_mode = context.user_data.get('waiting_for_xlsx', False)
         is_append_mode = context.user_data.get('waiting_for_append', False)
 
-        # ---- ZIP Upload Support ----
         if original_name.endswith(".zip"):
             try:
                 extract_path = os.path.join("received_files", f"zip_{update.effective_user.id}")
@@ -360,38 +281,28 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 print(f"ZIP Error: {e}")
             return
 
-        # ---- PDF Upload Support ----
         if original_name.endswith(".pdf"):
             try:
                 excel_path = pdf_to_excel(file_path)
                 os.remove(file_path)
-                
                 if is_xlsx_mode:
                     context.user_data['waiting_for_xlsx'] = False
                     await update.message.reply_document(document=open(excel_path, "rb"))
                     os.remove(excel_path)
                     await update.message.reply_text("✅ PDF → Excel (Not Stored).")
-                    log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "/xlsx", f"PDF Converted (Not Stored): {original_name}")
                     return
-                
                 if is_append_mode:
                     context.user_data['waiting_for_append'] = False
                     await append_file(update, context, excel_path, original_name)
-                    log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "/append", f"PDF Appended: {original_name}")
                     return
-                
                 if 'files' not in context.user_data:
                     context.user_data['files'] = {}
                 context.user_data['files'][original_name.replace('.pdf', '.xlsx')] = excel_path
-                log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "PDF Upload", f"Stored: {original_name}")
-                
             except Exception as e:
                 os.remove(file_path)
                 await update.message.reply_text(f"⚠️ PDF Error: {str(e)}")
-                print(f"PDF Error: {e}")
             return
 
-        # ---- TXT/CSV ----
         if original_name.endswith((".txt", ".csv")):
             excel_path = convert_to_excel(file_path)
             os.remove(file_path)
@@ -400,61 +311,38 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_document(document=open(excel_path, "rb"))
                 os.remove(excel_path)
                 await update.message.reply_text("✅ Converted (Not Stored).")
-                log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "/xlsx", f"TXT/CSV Converted (Not Stored): {original_name}")
                 return
             if is_append_mode:
                 context.user_data['waiting_for_append'] = False
                 await append_file(update, context, excel_path, original_name)
-                log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "/append", f"TXT/CSV Appended: {original_name}")
                 return
             if 'files' not in context.user_data:
                 context.user_data['files'] = {}
             context.user_data['files'][original_name] = excel_path
-            log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "TXT/CSV Upload", f"Stored: {original_name}")
 
-        # ---- Excel ----
         elif original_name.endswith((".xlsx", ".xls")):
             if is_xlsx_mode:
                 context.user_data['waiting_for_xlsx'] = False
                 await update.message.reply_document(document=open(file_path, "rb"))
                 os.remove(file_path)
                 await update.message.reply_text("✅ File Sent (Not Stored).")
-                log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "/xlsx", f"Excel Sent (Not Stored): {original_name}")
                 return
             if is_append_mode:
                 context.user_data['waiting_for_append'] = False
                 await append_file(update, context, file_path, original_name)
-                log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "/append", f"Excel Appended: {original_name}")
                 return
             if 'files' not in context.user_data:
                 context.user_data['files'] = {}
             context.user_data['files'][original_name] = file_path
-            log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "Excel Upload", f"Stored: {original_name}")
 
-        # ---- Images (Photo) ----
         elif original_name.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff')):
-            if not is_xlsx_mode:
-                os.remove(file_path)
-                await update.message.reply_text("❌ Use /xlsx first, then send photo.")
-                return
-            try:
-                excel_path = ocr_image_to_excel(file_path)
-                os.remove(file_path)
-                context.user_data['waiting_for_xlsx'] = False
-                await update.message.reply_document(document=open(excel_path, "rb"))
-                os.remove(excel_path)
-                await update.message.reply_text("✅ Image → Excel (Not Stored).")
-                log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "/xlsx", f"OCR Converted: {original_name}")
-            except Exception as e:
-                os.remove(file_path)
-                context.user_data['waiting_for_xlsx'] = False
-                await update.message.reply_text(f"⚠️ OCR Failed: {str(e)}")
-                print(f"OCR Error: {e}")
+            os.remove(file_path)
+            await update.message.reply_text("❌ Photo/OCR not supported on Render.")
             return
 
         else:
             os.remove(file_path)
-            await update.message.reply_text("❌ Only TXT, CSV, Excel, PDF, ZIP, or Images are supported.")
+            await update.message.reply_text("❌ Only TXT, CSV, Excel, PDF, ZIP allowed.")
             return
 
         count = len(context.user_data['files'])
@@ -465,7 +353,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"Error: {e}")
 
 async def append_file(update, context, new_file_path, original_name):
-    user = update.effective_user
     stored = context.user_data.get('files', {})
     if not stored:
         if 'files' not in context.user_data:
@@ -492,30 +379,23 @@ async def append_file(update, context, new_file_path, original_name):
         context.user_data['files'][f"merged_{update.effective_user.id}.xlsx"] = merged_path
         await update.message.reply_document(document=open(merged_path, "rb"))
         await update.message.reply_text(f"✅ Appended '{original_name}' to existing data. Merged file sent and stored.")
-        log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "/append", f"Appended {original_name}, Merged file sent")
     except Exception as e:
         await update.message.reply_text(f"⚠️ Append Error: {str(e)}")
         print(f"Append Error: {e}")
 
 async def xlsx_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "/xlsx", "Waiting for file")
     context.user_data['waiting_for_xlsx'] = True
-    await update.message.reply_text("📤 Send TXT, CSV, PDF, or PHOTO to convert (not stored).")
+    await update.message.reply_text("📤 Send TXT, CSV, or PDF to convert (not stored).")
 
 async def append_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
     stored = context.user_data.get('files', {})
     if not stored:
-        await update.message.reply_text("⚠️ No stored files. Upload some first, then /append.")
+        await update.message.reply_text("⚠️ No stored files. Upload some first.")
         return
     context.user_data['waiting_for_append'] = True
     await update.message.reply_text("📤 Send the file to append (TXT/CSV/PDF/Excel).")
-    log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "/append", "Waiting for file")
 
 async def preview_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "/preview", "")
     stored = context.user_data.get('files', {})
     if not stored:
         await update.message.reply_text("📭 No files stored.")
@@ -524,8 +404,6 @@ async def preview_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"📂 Stored Files ({len(stored)})\n{file_list}")
 
 async def merge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "/merge", "")
     stored = context.user_data.get('files', {})
     if len(stored) < 2:
         await update.message.reply_text("⚠️ Need at least 2 files to merge.")
@@ -551,8 +429,6 @@ async def merge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Merge Error: {str(e)}")
 
 async def split_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "/split", "")
     stored = context.user_data.get('files', {})
     if not stored:
         await update.message.reply_text("📭 No files stored. Upload first.")
@@ -600,16 +476,14 @@ async def split_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Split Error: {str(e)}")
         print(f"Split Error: {e}")
 
-# ---------- SEARCH & FILTER ----------
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
     stored = context.user_data.get('files', {})
     if not stored:
         await update.message.reply_text("📭 No files stored.")
         return
     args = update.message.text.split(maxsplit=1)
     if len(args) < 2:
-        await update.message.reply_text("❌ Usage: /search [column_name] [value]\nExample: /search Employee ID EMP001\nOr: /search EMP001 (searches in first column)")
+        await update.message.reply_text("❌ Usage: /search [column_name] [value]")
         return
     parts = args[1].rsplit(maxsplit=1)
     if len(parts) == 2:
@@ -625,14 +499,13 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         df = pd.concat(dfs, ignore_index=True)
         if col_name is None:
             col_name = df.columns[0]
-            await update.message.reply_text(f"🔍 Searching in column: '{col_name}'")
         if col_name not in df.columns:
-            await update.message.reply_text(f"❌ Column '{col_name}' not found. Available: {', '.join(df.columns)}")
+            await update.message.reply_text(f"❌ Column '{col_name}' not found.")
             return
         mask = df[col_name].astype(str).str.contains(search_value, case=False, na=False)
         result = df[mask]
         if len(result) == 0:
-            await update.message.reply_text(f"❌ No records found for '{search_value}' in column '{col_name}'.")
+            await update.message.reply_text(f"❌ No records found.")
             return
         if len(result) > 10:
             msg = f"🔍 Found {len(result)} records (showing first 10):\n\n"
@@ -646,19 +519,17 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msg += f"   • {col}: {row[col]}\n"
             msg += "\n"
         await update.message.reply_text(msg)
-        log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "/search", f"Searching for '{search_value}' in '{col_name}'")
     except Exception as e:
         await update.message.reply_text(f"⚠️ Search Error: {str(e)}")
 
 async def filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
     stored = context.user_data.get('files', {})
     if not stored:
         await update.message.reply_text("📭 No files stored.")
         return
     args = update.message.text.split(maxsplit=1)
     if len(args) < 2:
-        await update.message.reply_text("❌ Usage: /filter [column] [operator] [value]\nExamples:\n/filter Department IT\n/filter Salary > 50000\n/filter Name contains Rahul")
+        await update.message.reply_text("❌ Usage: /filter [column] [operator] [value]")
         return
     query = args[1].strip()
     operators = ['>=', '<=', '!=', '==', '>', '<', 'contains']
@@ -679,7 +550,7 @@ async def filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             value = parts[1].strip()
             operator = '=='
         else:
-            await update.message.reply_text("❌ Invalid format. Use: /filter Column Value or /filter Column > Value")
+            await update.message.reply_text("❌ Invalid format.")
             return
     try:
         dfs = []
@@ -687,7 +558,7 @@ async def filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             dfs.append(pd.read_excel(path))
         df = pd.concat(dfs, ignore_index=True)
         if col_name not in df.columns:
-            await update.message.reply_text(f"❌ Column '{col_name}' not found. Available: {', '.join(df.columns)}")
+            await update.message.reply_text(f"❌ Column '{col_name}' not found.")
             return
         if operator == 'contains':
             mask = df[col_name].astype(str).str.contains(value, case=False, na=False)
@@ -705,13 +576,13 @@ async def filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mask = df[col_name].astype(str) == value
         result = df[mask]
         if len(result) == 0:
-            await update.message.reply_text(f"❌ No records found for '{query}'.")
+            await update.message.reply_text(f"❌ No records found.")
             return
         if len(result) > 10:
-            msg = f"📊 Found {len(result)} records (showing first 10) matching '{query}':\n\n"
+            msg = f"📊 Found {len(result)} records (showing first 10):\n\n"
             result_display = result.head(10)
         else:
-            msg = f"📊 Found {len(result)} records matching '{query}':\n\n"
+            msg = f"📊 Found {len(result)} records:\n\n"
             result_display = result
         for idx, row in result_display.iterrows():
             msg += f"📌 **Row {idx+1}:**\n"
@@ -719,14 +590,10 @@ async def filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msg += f"   • {col}: {row[col]}\n"
             msg += "\n"
         await update.message.reply_text(msg)
-        log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "/filter", f"Filtering: {query}")
     except Exception as e:
         await update.message.reply_text(f"⚠️ Filter Error: {str(e)}")
 
-# ---------- STATS ----------
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "/stats", "")
     stored = context.user_data.get('files', {})
     if not stored:
         await update.message.reply_text("📭 No files stored.")
@@ -737,7 +604,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             dfs.append(pd.read_excel(path))
         df = pd.concat(dfs, ignore_index=True)
         total = len(df)
-        msg = f"📊 **Dataset Statistics**\n"
+        msg = f"📊 **Statistics**\n"
         msg += f"👥 Total Records: {total}\n"
         msg += f"📋 Total Columns: {len(df.columns)}\n"
         msg += f"📂 Columns: {', '.join(df.columns)}\n\n"
@@ -752,7 +619,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dup_count = df[first_col].duplicated().sum()
         if dup_count > 0:
             msg += f"\n⚠️ Duplicate Records (based on '{first_col}'): {dup_count}\n"
-        msg += f"\n📌 **Unique Values (Top 3 categorical columns):**\n"
+        msg += f"\n📌 **Unique Values (Top 3 categorical):**\n"
         count = 0
         for col in df.columns:
             if df[col].dtype == 'object' and len(df[col].unique()) < 50:
@@ -761,18 +628,15 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if count >= 3:
                     break
         if count == 0:
-            msg += "   (No categorical columns detected)\n"
+            msg += "   (No categorical columns)\n"
         await update.message.reply_text(msg)
     except Exception as e:
         await update.message.reply_text(f"⚠️ Stats Error: {str(e)}")
 
-# ---------- REPORT ----------
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "/report", "")
     stored = context.user_data.get('files', {})
     if not stored:
-        await update.message.reply_text("📭 No files stored. Upload some files first.")
+        await update.message.reply_text("📭 No files stored.")
         return
     try:
         dfs = []
@@ -780,7 +644,7 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             dfs.append(pd.read_excel(path))
         df = pd.concat(dfs, ignore_index=True)
         if len(df) == 0:
-            await update.message.reply_text("⚠️ No data found in stored files.")
+            await update.message.reply_text("⚠️ No data found.")
             return
         report_path = os.path.join("received_files", f"report_{update.effective_user.id}.xlsx")
         with pd.ExcelWriter(report_path, engine='openpyxl') as writer:
@@ -852,10 +716,7 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Report Error: {str(e)}")
         print(f"Report Error: {e}")
 
-# ---------- CLEAN, REMOVE DUPLICATES, SORT, CLEAR ----------
 async def clean_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "/clean", "")
     stored = context.user_data.get('files', {})
     if not stored:
         await update.message.reply_text("📭 No files stored.")
@@ -872,8 +733,6 @@ async def clean_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Clean Error: {str(e)}")
 
 async def removeduplicate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "/removeduplicate", "")
     stored = context.user_data.get('files', {})
     if not stored:
         await update.message.reply_text("📭 No files stored.")
@@ -894,8 +753,6 @@ async def removeduplicate_command(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text(f"⚠️ Error: {str(e)}")
 
 async def sort_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "/sort", "")
     stored = context.user_data.get('files', {})
     if not stored:
         await update.message.reply_text("📭 No files stored.")
@@ -913,11 +770,9 @@ async def sort_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 beautify_excel(path, freeze_panes=True, auto_filter=True, alt_rows=True)
         await update.message.reply_text(f"✅ Sorted {len(stored)} files by '{col}'!")
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Sort Error: {str(e)}\nUsage: /sort [column_name]")
+        await update.message.reply_text(f"⚠️ Sort Error: {str(e)}")
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "/clear", "")
     stored = context.user_data.get('files', {})
     for path in stored.values():
         try:
@@ -927,28 +782,24 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['files'] = {}
     await update.message.reply_text("🧹 All stored files cleared.")
 
-# ---------- ADMIN PANEL ----------
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if user.id != ADMIN_ID:
         await update.message.reply_text("⛔ Unauthorized access.")
         return
-    
     args = context.args
     if not args:
         await update.message.reply_text(
             "👑 **Admin Panel**\n\n"
-            "/admin stats - User stats\n"
-            "/admin users - List all users\n"
-            "/admin logs [user_id] - Show logs (optional user_id)\n"
-            "/admin broadcast [message] - Send message to all users"
+            "/admin stats\n"
+            "/admin users\n"
+            "/admin logs [user_id]\n"
+            "/admin broadcast [message]"
         )
         return
-
     subcommand = args[0].lower()
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-
     if subcommand == "stats":
         c.execute("SELECT COUNT(*) FROM users")
         total_users = c.fetchone()[0]
@@ -962,7 +813,6 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📝 Total Actions: {total_actions}\n"
             f"📈 Today's Actions: {today_actions}"
         )
-
     elif subcommand == "users":
         c.execute("SELECT user_id, username, first_name, last_name, total_actions, last_active FROM users ORDER BY total_actions DESC LIMIT 20")
         rows = c.fetchall()
@@ -974,7 +824,6 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 name = row[2] or row[1] or str(row[0])
                 msg += f"• {name} (ID: {row[0]}) - Actions: {row[4]} - Last: {row[5][:10]}\n"
             await update.message.reply_text(msg)
-
     elif subcommand == "logs":
         target_user = int(args[1]) if len(args) > 1 else None
         if target_user:
@@ -992,11 +841,10 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     msg += f"• User {row[0]} | {row[1]} | {row[2]} | {row[3][:16]}\n"
             await update.message.reply_text(msg)
-
     elif subcommand == "broadcast":
         message = " ".join(args[1:])
         if not message:
-            await update.message.reply_text("❌ Please provide a message. Usage: /admin broadcast Hello everyone!")
+            await update.message.reply_text("❌ Please provide a message.")
             return
         c.execute("SELECT user_id FROM users")
         users = c.fetchall()
@@ -1008,51 +856,32 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except:
                 pass
         await update.message.reply_text(f"✅ Broadcast sent to {sent} users.")
-
     conn.close()
 
-# ---------- AI ASSISTANT (Natural Language) ----------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
     text = update.message.text.lower().strip()
-    text_clean = text.strip('.,?!')
-    
     try:
-        if "merge" in text_clean or "combine" in text_clean:
-            log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "AI:merge", "")
+        if "merge" in text or "combine" in text:
             await merge_command(update, context)
-        
-        elif "clear" in text_clean or "delete all" in text_clean or "remove all" in text_clean:
-            log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "AI:clear", "")
+        elif "clear" in text or "delete all" in text or "remove all" in text:
             await clear_command(update, context)
-        
-        elif "stat" in text_clean or "overview" in text_clean and "report" not in text_clean:
-            log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "AI:stats", "")
+        elif "stat" in text or "overview" in text and "report" not in text:
             await stats_command(update, context)
-        
-        elif "report" in text_clean or "generate report" in text_clean:
-            log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "AI:report", "")
+        elif "report" in text or "generate report" in text:
             await report_command(update, context)
-        
-        elif "clean" in text_clean or "remove empty" in text_clean:
-            log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "AI:clean", "")
+        elif "clean" in text or "remove empty" in text:
             await clean_command(update, context)
-        
-        elif "remove duplicate" in text_clean or "deduplicate" in text_clean or "delete duplicate" in text_clean:
-            log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "AI:removeduplicate", "")
+        elif "remove duplicate" in text or "deduplicate" in text:
             await removeduplicate_command(update, context)
-        
-        elif "split" in text_clean:
-            nums = re.findall(r'\d+', text_clean)
+        elif "split" in text:
+            nums = re.findall(r'\d+', text)
             if nums:
                 update.message.text = f"/split {nums[0]}"
             else:
                 update.message.text = "/split"
-            log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "AI:split", "")
             await split_command(update, context)
-        
-        elif "sort by" in text_clean or "sort" in text_clean:
-            parts = text_clean.split("by")
+        elif "sort by" in text or "sort" in text:
+            parts = text.split("by")
             if len(parts) > 1:
                 col = parts[1].strip().split()[0] if parts[1].strip() else None
                 if col:
@@ -1061,11 +890,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     update.message.text = "/sort"
             else:
                 update.message.text = "/sort"
-            log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "AI:sort", "")
             await sort_command(update, context)
-        
-        elif "search" in text_clean or "find" in text_clean or "show" in text_clean:
-            parts = text_clean.split()
+        elif "search" in text or "find" in text or "show" in text:
+            parts = text.split()
             keywords = ["search", "find", "show", "for", "me", "details", "record", "of"]
             for word in keywords:
                 if word in parts:
@@ -1073,45 +900,28 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if parts:
                 value = " ".join(parts).strip()
                 update.message.text = f"/search {value}"
-                log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "AI:search", value)
                 await search_command(update, context)
             else:
-                await update.message.reply_text("❌ Please specify what to search. Example: 'search EMP001'")
-        
-        elif "filter" in text_clean:
-            query = text_clean.replace("filter", "").strip()
+                await update.message.reply_text("❌ Please specify what to search.")
+        elif "filter" in text:
+            query = text.replace("filter", "").strip()
             if query:
                 update.message.text = f"/filter {query}"
-                log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "AI:filter", query)
                 await filter_command(update, context)
             else:
-                await update.message.reply_text("❌ Please specify filter. Example: 'filter department IT'")
-        
+                await update.message.reply_text("❌ Please specify filter.")
         else:
             await update.message.reply_text(
-                "🤖 **I didn't understand that.**\n\n"
-                "Try these naturally:\n"
-                "• 'merge all files'\n"
-                "• 'sort by salary'\n"
-                "• 'search emp001'\n"
-                "• 'filter department it'\n"
-                "• 'remove duplicates'\n"
-                "• 'generate report'\n"
-                "• 'clean data'\n"
-                "• 'split 100'\n"
-                "• 'stats'\n"
-                "• 'clear all'"
+                "🤖 **I didn't understand.**\n\n"
+                "Try: 'merge all files', 'sort by salary', 'search emp001', 'filter department it', 'remove duplicates', 'generate report', 'clean data', 'split 100', 'stats', 'clear all'"
             )
     except Exception as e:
         await update.message.reply_text(f"⚠️ AI Error: {str(e)}")
         print(f"AI Error: {e}")
 
-# ---- Main ----
 def main():
     init_db()
     app = Application.builder().token(TOKEN).build()
-    
-    # Command Handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("xlsx", xlsx_command))
     app.add_handler(CommandHandler("preview", preview_command))
@@ -1127,13 +937,8 @@ def main():
     app.add_handler(CommandHandler("sort", sort_command))
     app.add_handler(CommandHandler("clear", clear_command))
     app.add_handler(CommandHandler("admin", admin_command))
-    
-    # File Handler
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    
-    # AI Assistant (Text Handler)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    
     print("✅ Bot is running with all features + Admin Panel & Logs...")
     app.run_polling()
 
