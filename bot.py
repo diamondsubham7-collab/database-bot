@@ -188,7 +188,6 @@ def pdf_to_excel(pdf_path, output_path=None):
         print(f"PDF Error: {e}")
         raise
 
-# ---- Bot Commands ----
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "/start", "User started bot")
