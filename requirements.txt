@@ -1,8 +1,6 @@
-setuptools==65.5.0
-wheel==0.38.4
-python-telegram-bot==20.7
-pandas==1.5.3
-openpyxl==3.1.2
-python-dotenv==1.0.1
-pdfplumber==0.10.3
-pypdf==3.17.0
+python-telegram-bot==20.0
+pandas
+openpyxl
+python-dotenv
+pdfplumber
+pypdf
