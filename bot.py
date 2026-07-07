@@ -13,6 +13,8 @@ from datetime import datetime
 import pdfplumber
 from pypdf import PdfReader
 import sqlite3
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
@@ -919,6 +921,25 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"AI Error: {e}")
 
 def main():
+    # ---- Render Port Bind Hack ----
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'OK')
+
+    def run_server():
+        port = int(os.environ.get('PORT', 8080))
+        server = HTTPServer(('0.0.0.0', port), HealthHandler)
+        server.serve_forever()
+
+    # Start HTTP server in background
+    thread = threading.Thread(target=run_server, daemon=True)
+    thread.start()
+    print(f"✅ Health check server running on port {os.environ.get('PORT', 8080)}")
+
+    # ---- Original Bot Code ----
     init_db()
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
