@@ -4,7 +4,3 @@ openpyxl
 python-dotenv
 pdfplumber
 pypdf
-pypdfium2
-pytesseract
-pillow
-opencv-python-headless
