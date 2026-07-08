@@ -111,141 +111,124 @@ def convert_to_excel(input_path, output_path=None):
         raise
     return output_path
 
+# ---------- PDF TO EXCEL (FIXED) ----------
 def pdf_to_excel(pdf_path, output_path=None):
-    """Convert text-based PDF to Excel with smart parsing. No OCR fallback."""
+    """Convert text-based PDF to Excel — robust parsing."""
     if output_path is None:
         output_path = os.path.splitext(pdf_path)[0] + ".xlsx"
 
     def smart_parse(lines):
-        """Try multiple delimiters and strategies."""
-        # Strategy 1: Comma
+        """Try every possible delimiter to parse lines into a DataFrame."""
+        if not lines:
+            return None
+
+        # 1. Try comma (,)
         try:
-            if all(',' in line for line in lines):
-                df = pd.read_csv(io.StringIO('\n'.join(lines)), skipinitialspace=True, engine='python')
-                if len(df.columns) >= 2 and len(df) > 0:
-                    return df
+            df = pd.read_csv(io.StringIO('\n'.join(lines)), engine='python', skipinitialspace=True)
+            if len(df.columns) >= 2 and len(df) > 0:
+                return df
         except:
             pass
 
-        # Strategy 2: Tab
+        # 2. Try tab (\t)
         try:
-            if all('\t' in line for line in lines):
-                df = pd.read_csv(io.StringIO('\n'.join(lines)), delimiter='\t', skipinitialspace=True, engine='python')
-                if len(df.columns) >= 2:
-                    return df
+            df = pd.read_csv(io.StringIO('\n'.join(lines)), delimiter='\t', engine='python', skipinitialspace=True)
+            if len(df.columns) >= 2 and len(df) > 0:
+                return df
         except:
             pass
 
-        # Strategy 3: Multiple spaces (2+)
+        # 3. Try multiple spaces (2 or more)
         try:
             rows = []
             for line in lines:
                 parts = re.split(r'\s{2,}', line.strip())
                 if len(parts) > 1:
                     rows.append(parts)
-            if len(rows) > 1:
-                first_row = rows[0]
-                if all(not re.search(r'\d', part) for part in first_row):
-                    headers = first_row
-                    data = rows[1:]
+            if rows:
+                max_cols = max(len(r) for r in rows)
+                for r in rows:
+                    while len(r) < max_cols:
+                        r.append('')
+                # Check if first row looks like header
+                if all(not re.search(r'\d', r[0]) for r in rows[:1]):
+                    headers = rows[0]
+                    data = rows[1:] if len(rows) > 1 else []
                 else:
-                    max_cols = max(len(row) for row in rows)
                     headers = [f"Col_{i+1}" for i in range(max_cols)]
                     data = rows
-                for row in data:
-                    while len(row) < len(headers):
-                        row.append('')
                 df = pd.DataFrame(data, columns=headers)
                 if len(df) > 0 and len(df.columns) > 1:
                     return df
         except:
             pass
 
-        # Strategy 4: Key:Value
+        # 4. Key:Value format
         records = []
-        current_record = {}
+        cur = {}
         for line in lines:
             if ':' in line:
-                parts = line.split(':', 1)
-                key = parts[0].strip()
-                value = parts[1].strip()
-                if key == "Employee ID" and current_record:
-                    records.append(current_record)
-                    current_record = {}
-                current_record[key] = value
-        if current_record:
-            records.append(current_record)
+                k, v = line.split(':', 1)
+                k, v = k.strip(), v.strip()
+                if k == "Employee ID" and cur:
+                    records.append(cur)
+                    cur = {}
+                cur[k] = v
+        if cur:
+            records.append(cur)
         if records:
-            headers = list(records[0].keys())
-            data = []
-            for rec in records:
-                row = [rec.get(h, '') for h in headers]
-                data.append(row)
-            return pd.DataFrame(data, columns=headers)
+            df = pd.DataFrame(records)
+            if len(df) > 0 and len(df.columns) > 1:
+                return df
 
-        # Strategy 5: Single column fallback
-        if lines:
-            return pd.DataFrame(lines, columns=["Data"])
+        # 5. Single column fallback
+        df = pd.DataFrame(lines, columns=["Data"])
+        if len(df) > 0:
+            return df
         return None
 
     try:
         all_text = []
-        all_tables = []
-
-        # pdfplumber
+        # Use pypdf first (most reliable for raw text)
         try:
-            with pdfplumber.open(pdf_path) as pdf:
-                for page in pdf.pages:
-                    tables = page.extract_tables()
-                    for table in tables:
-                        if table and len(table) > 0:
-                            clean_table = [row for row in table if any(cell for cell in row)]
-                            if clean_table:
-                                all_tables.append(clean_table)
-                    text = page.extract_text()
-                    if text:
-                        all_text.append(text)
+            reader = PdfReader(pdf_path)
+            for page in reader.pages:
+                text = page.extract_text()
+                if text:
+                    all_text.append(text)
         except Exception as e:
-            print(f"pdfplumber error: {e}")
+            print(f"pypdf error: {e}")
 
-        # pypdf fallback
-        if not all_tables and not all_text:
+        # Fallback to pdfplumber
+        if not all_text:
             try:
-                reader = PdfReader(pdf_path)
-                for page in reader.pages:
-                    text = page.extract_text()
-                    if text:
-                        all_text.append(text)
+                with pdfplumber.open(pdf_path) as pdf:
+                    for page in pdf.pages:
+                        text = page.extract_text()
+                        if text:
+                            all_text.append(text)
             except Exception as e:
-                print(f"pypdf error: {e}")
+                print(f"pdfplumber error: {e}")
 
-        if all_tables:
-            table = all_tables[0]
-            headers = table[0] if table else []
-            data = table[1:] if len(table) > 1 else []
-            df = pd.DataFrame(data, columns=headers)
-            df.to_excel(output_path, index=False, engine='openpyxl')
-            beautify_excel(output_path, freeze_panes=True, auto_filter=True, alt_rows=True)
-            return output_path
+        if not all_text:
+            raise ValueError("❌ No selectable text found. Please upload a text-based PDF (not scanned).")
 
-        if all_text:
-            full_text = "\n".join(all_text)
-            lines = [line.strip() for line in full_text.split('\n') if line.strip()]
-            df = smart_parse(lines)
-            if df is not None and len(df) > 0:
-                df.to_excel(output_path, index=False, engine='openpyxl')
-                beautify_excel(output_path, freeze_panes=True, auto_filter=True, alt_rows=True)
-                return output_path
+        full_text = "\n".join(all_text)
+        lines = [line.strip() for line in full_text.split('\n') if line.strip()]
+        df = smart_parse(lines)
+        if df is None or len(df) == 0:
+            raise ValueError("Could not parse PDF content into a table.")
 
-        # No text found -> scanned PDF
-        raise ValueError("❌ No selectable text found. This appears to be a scanned/image-based PDF.\nPlease upload a text-based PDF (one where you can select/copy text).")
+        df.to_excel(output_path, index=False, engine='openpyxl')
+        beautify_excel(output_path, freeze_panes=True, auto_filter=True, alt_rows=True)
+        return output_path
 
     except Exception as e:
         print(f"PDF Error: {e}")
         raise
 
 def parse_text_to_df(text):
-    """Parse pasted text as CSV/TXT data."""
+    """Parse pasted CSV/TXT data."""
     lines = [line.strip() for line in text.split('\n') if line.strip()]
     if len(lines) < 2:
         return None
@@ -266,7 +249,7 @@ def parse_text_to_df(text):
             continue
     return None
 
-# ---- Bot Commands ----
+# ---------- BOT COMMANDS ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "/start", "User started bot")
@@ -275,7 +258,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📤 **Upload:**\n"
         "• TXT/CSV → Convert & Store\n"
         "• Excel → Store Directly\n"
-        "• PDF → Extract & Convert to Excel (text-based only, no scanned PDFs)\n"
+        "• PDF → Extract & Convert to Excel (text-based only)\n"
         "• ZIP → Extract & Merge All (Auto)\n\n"
         "⚙️ **Commands:**\n"
         "/xlsx → Convert (No Store)\n"
@@ -962,7 +945,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     is_xlsx_mode = context.user_data.get('waiting_for_xlsx', False)
 
-    # Check for CSV/TXT data
     df = parse_text_to_df(text)
     if df is not None:
         if is_xlsx_mode:
@@ -988,7 +970,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"✅ Pasted data stored as '{filename}'. ({len(context.user_data['files'])} files)")
             return
 
-    # AI commands
     text_clean = text.lower().strip('.,?!')
     try:
         if "merge" in text_clean or "combine" in text_clean:
@@ -1054,7 +1035,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"AI Error: {e}")
 
 def main():
-    # ---- Render Port Bind Hack ----
     class HealthHandler(BaseHTTPRequestHandler):
         def do_GET(self):
             self.send_response(200)
@@ -1071,7 +1051,6 @@ def main():
     thread.start()
     print(f"✅ Health check server running on port {os.environ.get('PORT', 8080)}")
 
-    # ---- Bot ----
     init_db()
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -1091,7 +1070,7 @@ def main():
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    print("✅ Bot is running with all features (PDF parsing fixed, no OCR, /clear reminder)...")
+    print("✅ Bot is running with all features (PDF parsing fixed, OCR removed)...")
     app.run_polling()
 
 if __name__ == "__main__":
