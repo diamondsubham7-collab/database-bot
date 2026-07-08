@@ -15,6 +15,17 @@ from pypdf import PdfReader
 import sqlite3
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import tempfile
+
+# ---- OCR & PDF Rendering ----
+try:
+    import pytesseract
+    from PIL import Image, ImageEnhance, ImageFilter
+    import pypdfium2 as pdfium
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+    print("⚠️ OCR libraries not installed. Scanned PDFs will not be supported.")
 
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
@@ -111,11 +122,52 @@ def convert_to_excel(input_path, output_path=None):
     return output_path
 
 def pdf_to_excel(pdf_path, output_path=None):
+    """Convert PDF to Excel with OCR fallback for scanned/image PDFs."""
     if output_path is None:
         output_path = os.path.splitext(pdf_path)[0] + ".xlsx"
+
+    # ---------- Helper: parse lines to dataframe ----------
+    def parse_lines_to_df(lines):
+        # Try key:value format
+        records = []
+        current_record = {}
+        for line in lines:
+            if ':' in line:
+                parts = line.split(':', 1)
+                key = parts[0].strip()
+                value = parts[1].strip()
+                if key == "Employee ID" and current_record:
+                    records.append(current_record)
+                    current_record = {}
+                current_record[key] = value
+        if current_record:
+            records.append(current_record)
+        if records:
+            headers = list(records[0].keys())
+            data = []
+            for rec in records:
+                row = [rec.get(h, '') for h in headers]
+                data.append(row)
+            return pd.DataFrame(data, columns=headers)
+        
+        # Try table format (space/tab separated)
+        rows = []
+        for line in lines:
+            row = line.split()
+            if row:
+                rows.append(row)
+        if rows:
+            headers = rows[0]
+            data = rows[1:] if len(rows) > 1 else []
+            return pd.DataFrame(data, columns=headers)
+        return None
+
+    # ---------- Main ----------
     try:
         all_text = []
         all_tables = []
+
+        # 1. Try pdfplumber for tables and text
         try:
             with pdfplumber.open(pdf_path) as pdf:
                 for page in pdf.pages:
@@ -130,6 +182,8 @@ def pdf_to_excel(pdf_path, output_path=None):
                         all_text.append(text)
         except Exception as e:
             print(f"pdfplumber error: {e}")
+
+        # 2. Fallback to pypdf
         if not all_tables and not all_text:
             try:
                 reader = PdfReader(pdf_path)
@@ -139,6 +193,8 @@ def pdf_to_excel(pdf_path, output_path=None):
                         all_text.append(text)
             except Exception as e:
                 print(f"pypdf error: {e}")
+
+        # 3. If tables found, use first table
         if all_tables:
             table = all_tables[0]
             headers = table[0] if table else []
@@ -147,49 +203,98 @@ def pdf_to_excel(pdf_path, output_path=None):
             df.to_excel(output_path, index=False, engine='openpyxl')
             beautify_excel(output_path, freeze_panes=True, auto_filter=True, alt_rows=True)
             return output_path
+
+        # 4. If text found, parse and convert
         if all_text:
             full_text = "\n".join(all_text)
             lines = [line.strip() for line in full_text.split('\n') if line.strip()]
-            records = []
-            current_record = {}
-            for line in lines:
-                if ':' in line:
-                    parts = line.split(':', 1)
-                    key = parts[0].strip()
-                    value = parts[1].strip()
-                    if key == "Employee ID" and current_record:
-                        records.append(current_record)
-                        current_record = {}
-                    current_record[key] = value
-            if current_record:
-                records.append(current_record)
-            if records:
-                headers = list(records[0].keys())
-                data = []
-                for rec in records:
-                    row = [rec.get(h, '') for h in headers]
-                    data.append(row)
-                df = pd.DataFrame(data, columns=headers)
+            df = parse_lines_to_df(lines)
+            if df is not None:
                 df.to_excel(output_path, index=False, engine='openpyxl')
                 beautify_excel(output_path, freeze_panes=True, auto_filter=True, alt_rows=True)
                 return output_path
-            rows = []
-            for line in lines:
-                row = line.split()
-                if row:
-                    rows.append(row)
-            if rows:
-                headers = rows[0]
-                data = rows[1:] if len(rows) > 1 else []
-                df = pd.DataFrame(data, columns=headers)
-                df.to_excel(output_path, index=False, engine='openpyxl')
-                beautify_excel(output_path, freeze_panes=True, auto_filter=True, alt_rows=True)
-                return output_path
-        raise ValueError("No text or tables found in PDF")
+
+        # ---------- 5. No text found → OCR fallback ----------
+        if not OCR_AVAILABLE:
+            raise ValueError("PDF contains no selectable text, but OCR libraries are not installed. Please install: pip install pytesseract pypdfium2 pillow")
+
+        print("⚠️ No text found in PDF. Attempting OCR...")
+        try:
+            # Render PDF pages as images using pypdfium2 (pure Python, no poppler)
+            pdf = pdfium.PdfDocument(pdf_path)
+            all_ocr_lines = []
+            # Limit to first 5 pages to avoid memory issues
+            page_count = min(len(pdf), 5)
+            for page_index in range(page_count):
+                page = pdf[page_index]
+                # Render at 200 DPI (good balance)
+                bitmap = page.render(scale=200/72, rotation=0)  # 200 DPI
+                pil_image = bitmap.to_pil()
+                
+                # Preprocess image for better OCR
+                pil_image = pil_image.convert('L')  # Grayscale
+                # Enhance contrast
+                enhancer = ImageEnhance.Contrast(pil_image)
+                pil_image = enhancer.enhance(2.0)
+                # Threshold
+                pil_image = pil_image.point(lambda p: p > 128 and 255)
+                
+                # OCR
+                text = pytesseract.image_to_string(pil_image, lang='eng+hin')
+                if text.strip():
+                    all_ocr_lines.extend([line.strip() for line in text.split('\n') if line.strip()])
+                
+                # Cleanup to free memory
+                del bitmap
+                del pil_image
+
+            if not all_ocr_lines:
+                raise ValueError("OCR could not extract any text from the PDF.")
+
+            # Parse OCR text
+            df = parse_lines_to_df(all_ocr_lines)
+            if df is None:
+                raise ValueError("OCR text could not be parsed into a table format.")
+
+            df.to_excel(output_path, index=False, engine='openpyxl')
+            beautify_excel(output_path, freeze_panes=True, auto_filter=True, alt_rows=True)
+            print("✅ OCR successful! PDF converted.")
+            return output_path
+
+        except Exception as e:
+            print(f"OCR Error: {e}")
+            raise ValueError(f"OCR failed: {str(e)}. Please ensure the PDF contains readable text or images.")
+
     except Exception as e:
         print(f"PDF Error: {e}")
         raise
 
+# ---------- Text to DataFrame Parser ----------
+def parse_text_to_df(text):
+    """Attempt to parse a telegram text message as CSV/TXT data and return a DataFrame."""
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
+    if len(lines) < 2:
+        return None  # Need at least header + one row
+
+    # Try common delimiters: comma, tab, semicolon, pipe, space (multiple)
+    delimiters = [',', '\t', ';', '|', r'\s+']
+    for delim in delimiters:
+        try:
+            first_parts = re.split(delim, lines[0])
+            if len(first_parts) < 2:
+                continue
+            counts = [len(re.split(delim, line)) for line in lines[:3]]
+            if counts.count(counts[0]) >= 2:
+                data_str = '\n'.join(lines)
+                df = pd.read_csv(io.StringIO(data_str), delimiter=delim if delim != r'\s+' else None,
+                                  engine='python', skipinitialspace=True)
+                if len(df.columns) >= 2 and len(df) > 0:
+                    return df
+        except Exception:
+            continue
+    return None
+
+# ---- Bot Commands ----
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "/start", "User started bot")
@@ -198,7 +303,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📤 **Upload:**\n"
         "• TXT/CSV → Convert & Store\n"
         "• Excel → Store Directly\n"
-        "• PDF → Extract & Convert to Excel\n"
+        "• PDF → Extract & Convert to Excel (supports scanned PDFs via OCR)\n"
         "• ZIP → Extract & Merge All (Auto)\n\n"
         "⚙️ **Commands:**\n"
         "/xlsx → Convert (No Store)\n"
@@ -220,11 +325,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 'search emp001'\n"
         "• 'filter department it'\n"
         "• 'remove duplicates'\n"
-        "• 'generate report'"
+        "• 'generate report'\n\n"
+        "💡 **Tip:** You can also paste CSV/TXT data directly as a message!\n\n"
+        "⚠️ **Important:** After your work is done, type **/clear** to delete stored files and free up server space.\n"
+        "This ensures the bot remains fast and reliable for everyone."
     )
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    file_path = None
     try:
         doc = update.message.document
         original_name = doc.file_name
@@ -277,15 +386,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "ZIP Upload", f"Extracted and merged {len(all_files)} files")
 
             except Exception as e:
-                os.remove(file_path)
                 await update.message.reply_text(f"⚠️ ZIP Error: {str(e)}")
                 print(f"ZIP Error: {e}")
+            finally:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
             return
 
         if original_name.endswith(".pdf"):
             try:
                 excel_path = pdf_to_excel(file_path)
-                os.remove(file_path)
                 if is_xlsx_mode:
                     context.user_data['waiting_for_xlsx'] = False
                     await update.message.reply_document(document=open(excel_path, "rb"))
@@ -299,14 +409,18 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if 'files' not in context.user_data:
                     context.user_data['files'] = {}
                 context.user_data['files'][original_name.replace('.pdf', '.xlsx')] = excel_path
+                log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "PDF Upload", f"Stored: {original_name}")
+                await update.message.reply_text(f"✅ PDF converted and stored.")
             except Exception as e:
-                os.remove(file_path)
                 await update.message.reply_text(f"⚠️ PDF Error: {str(e)}")
+                print(f"PDF Error: {e}")
+            finally:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
             return
 
         if original_name.endswith((".txt", ".csv")):
             excel_path = convert_to_excel(file_path)
-            os.remove(file_path)
             if is_xlsx_mode:
                 context.user_data['waiting_for_xlsx'] = False
                 await update.message.reply_document(document=open(excel_path, "rb"))
@@ -320,12 +434,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if 'files' not in context.user_data:
                 context.user_data['files'] = {}
             context.user_data['files'][original_name] = excel_path
+            log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "TXT/CSV Upload", f"Stored: {original_name}")
+            await update.message.reply_text(f"✅ '{original_name}' Stored. ({len(context.user_data['files'])} files)")
 
         elif original_name.endswith((".xlsx", ".xls")):
             if is_xlsx_mode:
                 context.user_data['waiting_for_xlsx'] = False
                 await update.message.reply_document(document=open(file_path, "rb"))
-                os.remove(file_path)
                 await update.message.reply_text("✅ File Sent (Not Stored).")
                 return
             if is_append_mode:
@@ -335,23 +450,27 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if 'files' not in context.user_data:
                 context.user_data['files'] = {}
             context.user_data['files'][original_name] = file_path
+            log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "Excel Upload", f"Stored: {original_name}")
+            await update.message.reply_text(f"✅ '{original_name}' Stored. ({len(context.user_data['files'])} files)")
 
         elif original_name.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff')):
-            os.remove(file_path)
             await update.message.reply_text("❌ Photo/OCR not supported on Render.")
-            return
+            if os.path.exists(file_path):
+                os.remove(file_path)
 
         else:
-            os.remove(file_path)
             await update.message.reply_text("❌ Only TXT, CSV, Excel, PDF, ZIP allowed.")
-            return
-
-        count = len(context.user_data['files'])
-        await update.message.reply_text(f"✅ '{original_name}' Stored. ({count} files)")
+            if os.path.exists(file_path):
+                os.remove(file_path)
 
     except Exception as e:
         await update.message.reply_text(f"⚠️ Error: {str(e)}")
         print(f"Error: {e}")
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except:
+                pass
 
 async def append_file(update, context, new_file_path, original_name):
     stored = context.user_data.get('files', {})
@@ -386,7 +505,7 @@ async def append_file(update, context, new_file_path, original_name):
 
 async def xlsx_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['waiting_for_xlsx'] = True
-    await update.message.reply_text("📤 Send TXT, CSV, or PDF to convert (not stored).")
+    await update.message.reply_text("📤 Send TXT, CSV, PDF, or paste CSV/TXT data directly to convert (not stored).")
 
 async def append_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stored = context.user_data.get('files', {})
@@ -428,6 +547,7 @@ async def merge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Merged {len(dfs)} files successfully!")
     except Exception as e:
         await update.message.reply_text(f"⚠️ Merge Error: {str(e)}")
+        print(f"Merge Error: {e}")
 
 async def split_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stored = context.user_data.get('files', {})
@@ -477,6 +597,7 @@ async def split_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Split Error: {str(e)}")
         print(f"Split Error: {e}")
 
+# ---------- SEARCH & FILTER ----------
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stored = context.user_data.get('files', {})
     if not stored:
@@ -594,6 +715,7 @@ async def filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"⚠️ Filter Error: {str(e)}")
 
+# ---------- STATS ----------
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stored = context.user_data.get('files', {})
     if not stored:
@@ -634,6 +756,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"⚠️ Stats Error: {str(e)}")
 
+# ---------- REPORT ----------
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stored = context.user_data.get('files', {})
     if not stored:
@@ -717,6 +840,7 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Report Error: {str(e)}")
         print(f"Report Error: {e}")
 
+# ---------- CLEAN ----------
 async def clean_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stored = context.user_data.get('files', {})
     if not stored:
@@ -733,6 +857,7 @@ async def clean_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"⚠️ Clean Error: {str(e)}")
 
+# ---------- REMOVE DUPLICATE (FIXED) ----------
 async def removeduplicate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stored = context.user_data.get('files', {})
     if not stored:
@@ -744,15 +869,24 @@ async def removeduplicate_command(update: Update, context: ContextTypes.DEFAULT_
             df = pd.read_excel(path)
             first_col = df.columns[0]
             before = len(df)
-            df = df.drop_duplicates(subset=[first_col], keep='first')
-            after = len(df)
-            total_removed += (before - after)
-            df.to_excel(path, index=False, engine='openpyxl')
+            df_cleaned = df.drop_duplicates(subset=[first_col], keep='first')
+            after = len(df_cleaned)
+            removed = before - after
+            total_removed += removed
+            # Save cleaned file back
+            df_cleaned.to_excel(path, index=False, engine='openpyxl')
             beautify_excel(path, freeze_panes=True, auto_filter=True, alt_rows=True)
-        await update.message.reply_text(f"✅ Removed {total_removed} duplicate records from {len(stored)} files!")
+            # Send the cleaned file
+            if removed > 0:
+                await update.message.reply_document(
+                    document=open(path, "rb"),
+                    filename=f"cleaned_{name}"
+                )
+        await update.message.reply_text(f"✅ Removed {total_removed} duplicate records from {len(stored)} files! Cleaned files sent.")
     except Exception as e:
         await update.message.reply_text(f"⚠️ Error: {str(e)}")
 
+# ---------- SORT ----------
 async def sort_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stored = context.user_data.get('files', {})
     if not stored:
@@ -773,6 +907,7 @@ async def sort_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"⚠️ Sort Error: {str(e)}")
 
+# ---------- CLEAR ----------
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stored = context.user_data.get('files', {})
     for path in stored.values():
@@ -781,8 +916,9 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
     context.user_data['files'] = {}
-    await update.message.reply_text("🧹 All stored files cleared.")
+    await update.message.reply_text("🧹 All stored files cleared. Server space freed!")
 
+# ---------- ADMIN PANEL ----------
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if user.id != ADMIN_ID:
@@ -859,30 +995,65 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Broadcast sent to {sent} users.")
     conn.close()
 
+# ---------- TEXT HANDLER (AI + Data Paste) ----------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.lower().strip()
+    user = update.effective_user
+    text = update.message.text.strip()
+    is_xlsx_mode = context.user_data.get('waiting_for_xlsx', False)
+
+    # Check if text looks like CSV/TXT data
+    df = parse_text_to_df(text)
+    if df is not None:
+        # It is data!
+        if is_xlsx_mode:
+            context.user_data['waiting_for_xlsx'] = False
+            # Convert to Excel and send (not stored)
+            with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
+                tmp_path = tmp.name
+            df.to_excel(tmp_path, index=False, engine='openpyxl')
+            beautify_excel(tmp_path, freeze_panes=True, auto_filter=True, alt_rows=True)
+            await update.message.reply_document(document=open(tmp_path, "rb"))
+            os.remove(tmp_path)
+            await update.message.reply_text("✅ Pasted data converted to Excel (Not Stored).")
+            return
+        else:
+            # Normal mode: save as stored file
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"pasted_data_{timestamp}.xlsx"
+            file_path = os.path.join("received_files", filename)
+            df.to_excel(file_path, index=False, engine='openpyxl')
+            beautify_excel(file_path, freeze_panes=True, auto_filter=True, alt_rows=True)
+            if 'files' not in context.user_data:
+                context.user_data['files'] = {}
+            context.user_data['files'][filename] = file_path
+            log_action_sync(user.id, user.username or "", user.first_name or "", user.last_name or "", "Paste Data", f"Stored as {filename}")
+            await update.message.reply_text(f"✅ Pasted data stored as '{filename}'. ({len(context.user_data['files'])} files)")
+            return
+
+    # If not data, treat as AI command
+    text_clean = text.lower().strip('.,?!')
     try:
-        if "merge" in text or "combine" in text:
+        if "merge" in text_clean or "combine" in text_clean:
             await merge_command(update, context)
-        elif "clear" in text or "delete all" in text or "remove all" in text:
+        elif "clear" in text_clean or "delete all" in text_clean or "remove all" in text_clean:
             await clear_command(update, context)
-        elif "stat" in text or "overview" in text and "report" not in text:
+        elif "stat" in text_clean or "overview" in text_clean and "report" not in text_clean:
             await stats_command(update, context)
-        elif "report" in text or "generate report" in text:
+        elif "report" in text_clean or "generate report" in text_clean:
             await report_command(update, context)
-        elif "clean" in text or "remove empty" in text:
+        elif "clean" in text_clean or "remove empty" in text_clean:
             await clean_command(update, context)
-        elif "remove duplicate" in text or "deduplicate" in text:
+        elif "remove duplicate" in text_clean or "deduplicate" in text_clean:
             await removeduplicate_command(update, context)
-        elif "split" in text:
-            nums = re.findall(r'\d+', text)
+        elif "split" in text_clean:
+            nums = re.findall(r'\d+', text_clean)
             if nums:
                 update.message.text = f"/split {nums[0]}"
             else:
                 update.message.text = "/split"
             await split_command(update, context)
-        elif "sort by" in text or "sort" in text:
-            parts = text.split("by")
+        elif "sort by" in text_clean or "sort" in text_clean:
+            parts = text_clean.split("by")
             if len(parts) > 1:
                 col = parts[1].strip().split()[0] if parts[1].strip() else None
                 if col:
@@ -892,8 +1063,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 update.message.text = "/sort"
             await sort_command(update, context)
-        elif "search" in text or "find" in text or "show" in text:
-            parts = text.split()
+        elif "search" in text_clean or "find" in text_clean or "show" in text_clean:
+            parts = text_clean.split()
             keywords = ["search", "find", "show", "for", "me", "details", "record", "of"]
             for word in keywords:
                 if word in parts:
@@ -904,22 +1075,27 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await search_command(update, context)
             else:
                 await update.message.reply_text("❌ Please specify what to search.")
-        elif "filter" in text:
-            query = text.replace("filter", "").strip()
+        elif "filter" in text_clean:
+            query = text_clean.replace("filter", "").strip()
             if query:
                 update.message.text = f"/filter {query}"
                 await filter_command(update, context)
             else:
                 await update.message.reply_text("❌ Please specify filter.")
         else:
-            await update.message.reply_text(
-                "🤖 **I didn't understand.**\n\n"
-                "Try: 'merge all files', 'sort by salary', 'search emp001', 'filter department it', 'remove duplicates', 'generate report', 'clean data', 'split 100', 'stats', 'clear all'"
-            )
+            if is_xlsx_mode:
+                await update.message.reply_text("❌ I couldn't parse your message as CSV/TXT data. Please send a file or paste valid data.\n\nExample:\nEmployeeID,Name,Salary\nEMP001,Rahul,45000")
+            else:
+                await update.message.reply_text(
+                    "🤖 **I didn't understand.**\n\n"
+                    "Try: 'merge all files', 'sort by salary', 'search emp001', 'filter department it', 'remove duplicates', 'generate report', 'clean data', 'split 100', 'stats', 'clear all'\n\n"
+                    "💡 You can also paste CSV/TXT data directly!"
+                )
     except Exception as e:
         await update.message.reply_text(f"⚠️ AI Error: {str(e)}")
         print(f"AI Error: {e}")
 
+# ---------- MAIN ----------
 def main():
     # ---- Render Port Bind Hack ----
     class HealthHandler(BaseHTTPRequestHandler):
@@ -959,7 +1135,7 @@ def main():
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    print("✅ Bot is running with all features + Admin Panel & Logs...")
+    print("✅ Bot is running with all features (OCR fallback, duplicate fix, manual paste, /clear reminder)...")
     app.run_polling()
 
 if __name__ == "__main__":
