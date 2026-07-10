@@ -16,6 +16,7 @@ import sqlite3
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import tempfile
+import time
 
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
@@ -23,6 +24,9 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 os.makedirs("received_files", exist_ok=True)
 
 DB_PATH = "database.db"
+
+# ---- GLOBAL FLAG FOR HEALTH CHECK ----
+bot_is_alive = True
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -150,7 +154,6 @@ def pdf_to_excel(pdf_path, output_path=None):
                 for r in rows:
                     while len(r) < max_cols:
                         r.append('')
-                # Check if first row looks like header
                 if all(not re.search(r'\d', r[0]) for r in rows[:1]):
                     headers = rows[0]
                     data = rows[1:] if len(rows) > 1 else []
@@ -1034,44 +1037,91 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ AI Error: {str(e)}")
         print(f"AI Error: {e}")
 
+# ---------- MAIN WITH SMART HEALTH CHECK ----------
 def main():
+    global bot_is_alive
+    bot_is_alive = True
+
+    # ---- Health Check Server ----
     class HealthHandler(BaseHTTPRequestHandler):
         def do_GET(self):
-            self.send_response(200)
-            self.send_header('Content-type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(b'OK')
+            global bot_is_alive
+            if bot_is_alive:
+                self.send_response(200)
+                self.send_header('Content-type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(b'OK')
+            else:
+                self.send_response(503)
+                self.send_header('Content-type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(b'Service Unavailable: Bot polling stopped')
 
-    def run_server():
-        port = int(os.environ.get('PORT', 8080))
-        server = HTTPServer(('0.0.0.0', port), HealthHandler)
-        server.serve_forever()
+        def log_message(self, format, *args):
+            return  # Disable spam logs
 
-    thread = threading.Thread(target=run_server, daemon=True)
-    thread.start()
+    def run_health_server():
+        try:
+            port = int(os.environ.get('PORT', 8080))
+            server = HTTPServer(('0.0.0.0', port), HealthHandler)
+            server.serve_forever()
+        except Exception as e:
+            print(f"❌ Health server crashed: {e}")
+            os._exit(1)
+
+    health_thread = threading.Thread(target=run_health_server, daemon=False)
+    health_thread.start()
     print(f"✅ Health check server running on port {os.environ.get('PORT', 8080)}")
 
-    init_db()
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("xlsx", xlsx_command))
-    app.add_handler(CommandHandler("preview", preview_command))
-    app.add_handler(CommandHandler("merge", merge_command))
-    app.add_handler(CommandHandler("append", append_command))
-    app.add_handler(CommandHandler("split", split_command))
-    app.add_handler(CommandHandler("search", search_command))
-    app.add_handler(CommandHandler("filter", filter_command))
-    app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CommandHandler("report", report_command))
-    app.add_handler(CommandHandler("clean", clean_command))
-    app.add_handler(CommandHandler("removeduplicate", removeduplicate_command))
-    app.add_handler(CommandHandler("sort", sort_command))
-    app.add_handler(CommandHandler("clear", clear_command))
-    app.add_handler(CommandHandler("admin", admin_command))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    print("✅ Bot is running with all features (PDF parsing fixed, OCR removed)...")
-    app.run_polling()
+    # ---- Bot Polling Thread ----
+    def run_bot():
+        global bot_is_alive
+        try:
+            init_db()
+            app = Application.builder().token(TOKEN).build()
+            app.add_handler(CommandHandler("start", start))
+            app.add_handler(CommandHandler("xlsx", xlsx_command))
+            app.add_handler(CommandHandler("preview", preview_command))
+            app.add_handler(CommandHandler("merge", merge_command))
+            app.add_handler(CommandHandler("append", append_command))
+            app.add_handler(CommandHandler("split", split_command))
+            app.add_handler(CommandHandler("search", search_command))
+            app.add_handler(CommandHandler("filter", filter_command))
+            app.add_handler(CommandHandler("stats", stats_command))
+            app.add_handler(CommandHandler("report", report_command))
+            app.add_handler(CommandHandler("clean", clean_command))
+            app.add_handler(CommandHandler("removeduplicate", removeduplicate_command))
+            app.add_handler(CommandHandler("sort", sort_command))
+            app.add_handler(CommandHandler("clear", clear_command))
+            app.add_handler(CommandHandler("admin", admin_command))
+            app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+            app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+            print("✅ Bot polling started. Waiting for messages...")
+            app.run_polling()
+            print("⚠️ Bot polling stopped unexpectedly.")
+            bot_is_alive = False
+            os._exit(1)
+
+        except Exception as e:
+            print(f"❌ Bot polling CRASHED: {e}")
+            bot_is_alive = False
+            os._exit(1)
+
+    bot_thread = threading.Thread(target=run_bot, daemon=False)
+    bot_thread.start()
+
+    # ---- Keep main thread alive ----
+    try:
+        while True:
+            time.sleep(10)
+            if not bot_thread.is_alive():
+                print("⚠️ Bot thread died! Setting health check to fail...")
+                bot_is_alive = False
+                os._exit(1)
+    except KeyboardInterrupt:
+        print("Shutting down...")
+        os._exit(0)
 
 if __name__ == "__main__":
     main()
