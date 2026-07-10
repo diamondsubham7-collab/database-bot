@@ -16,7 +16,6 @@ import sqlite3
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import tempfile
-import time
 
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
@@ -24,9 +23,6 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 os.makedirs("received_files", exist_ok=True)
 
 DB_PATH = "database.db"
-
-# ---- GLOBAL FLAG FOR HEALTH CHECK ----
-bot_is_alive = True
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -115,34 +111,29 @@ def convert_to_excel(input_path, output_path=None):
         raise
     return output_path
 
-# ---------- PDF TO EXCEL (FIXED) ----------
 def pdf_to_excel(pdf_path, output_path=None):
     """Convert text-based PDF to Excel — robust parsing."""
     if output_path is None:
         output_path = os.path.splitext(pdf_path)[0] + ".xlsx"
 
     def smart_parse(lines):
-        """Try every possible delimiter to parse lines into a DataFrame."""
         if not lines:
             return None
-
-        # 1. Try comma (,)
+        # Try comma
         try:
             df = pd.read_csv(io.StringIO('\n'.join(lines)), engine='python', skipinitialspace=True)
             if len(df.columns) >= 2 and len(df) > 0:
                 return df
         except:
             pass
-
-        # 2. Try tab (\t)
+        # Try tab
         try:
             df = pd.read_csv(io.StringIO('\n'.join(lines)), delimiter='\t', engine='python', skipinitialspace=True)
             if len(df.columns) >= 2 and len(df) > 0:
                 return df
         except:
             pass
-
-        # 3. Try multiple spaces (2 or more)
+        # Try multiple spaces
         try:
             rows = []
             for line in lines:
@@ -165,8 +156,7 @@ def pdf_to_excel(pdf_path, output_path=None):
                     return df
         except:
             pass
-
-        # 4. Key:Value format
+        # Key:Value
         records = []
         cur = {}
         for line in lines:
@@ -183,8 +173,7 @@ def pdf_to_excel(pdf_path, output_path=None):
             df = pd.DataFrame(records)
             if len(df) > 0 and len(df.columns) > 1:
                 return df
-
-        # 5. Single column fallback
+        # Fallback
         df = pd.DataFrame(lines, columns=["Data"])
         if len(df) > 0:
             return df
@@ -192,7 +181,6 @@ def pdf_to_excel(pdf_path, output_path=None):
 
     try:
         all_text = []
-        # Use pypdf first (most reliable for raw text)
         try:
             reader = PdfReader(pdf_path)
             for page in reader.pages:
@@ -201,8 +189,6 @@ def pdf_to_excel(pdf_path, output_path=None):
                     all_text.append(text)
         except Exception as e:
             print(f"pypdf error: {e}")
-
-        # Fallback to pdfplumber
         if not all_text:
             try:
                 with pdfplumber.open(pdf_path) as pdf:
@@ -212,26 +198,21 @@ def pdf_to_excel(pdf_path, output_path=None):
                             all_text.append(text)
             except Exception as e:
                 print(f"pdfplumber error: {e}")
-
         if not all_text:
             raise ValueError("❌ No selectable text found. Please upload a text-based PDF (not scanned).")
-
         full_text = "\n".join(all_text)
         lines = [line.strip() for line in full_text.split('\n') if line.strip()]
         df = smart_parse(lines)
         if df is None or len(df) == 0:
             raise ValueError("Could not parse PDF content into a table.")
-
         df.to_excel(output_path, index=False, engine='openpyxl')
         beautify_excel(output_path, freeze_panes=True, auto_filter=True, alt_rows=True)
         return output_path
-
     except Exception as e:
         print(f"PDF Error: {e}")
         raise
 
 def parse_text_to_df(text):
-    """Parse pasted CSV/TXT data."""
     lines = [line.strip() for line in text.split('\n') if line.strip()]
     if len(lines) < 2:
         return None
@@ -724,7 +705,6 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         df = pd.concat(dfs, ignore_index=True)
         if len(df) == 0:
             await update.message.reply_text("⚠️ No data found.")
-            return
         report_path = os.path.join("received_files", f"report_{update.effective_user.id}.xlsx")
         with pd.ExcelWriter(report_path, engine='openpyxl') as writer:
             overview_data = {
@@ -1037,91 +1017,48 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ AI Error: {str(e)}")
         print(f"AI Error: {e}")
 
-# ---------- MAIN WITH SMART HEALTH CHECK ----------
+# ---------- MAIN (STABLE VERSION) ----------
 def main():
-    global bot_is_alive
-    bot_is_alive = True
-
-    # ---- Health Check Server ----
+    # ---- Simple HTTP server for Render health check ----
     class HealthHandler(BaseHTTPRequestHandler):
         def do_GET(self):
-            global bot_is_alive
-            if bot_is_alive:
-                self.send_response(200)
-                self.send_header('Content-type', 'text/plain')
-                self.end_headers()
-                self.wfile.write(b'OK')
-            else:
-                self.send_response(503)
-                self.send_header('Content-type', 'text/plain')
-                self.end_headers()
-                self.wfile.write(b'Service Unavailable: Bot polling stopped')
-
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'OK')
         def log_message(self, format, *args):
-            return  # Disable spam logs
+            return  # Disable logs
 
-    def run_health_server():
-        try:
-            port = int(os.environ.get('PORT', 8080))
-            server = HTTPServer(('0.0.0.0', port), HealthHandler)
-            server.serve_forever()
-        except Exception as e:
-            print(f"❌ Health server crashed: {e}")
-            os._exit(1)
+    def run_server():
+        port = int(os.environ.get('PORT', 8080))
+        server = HTTPServer(('0.0.0.0', port), HealthHandler)
+        server.serve_forever()
 
-    health_thread = threading.Thread(target=run_health_server, daemon=False)
-    health_thread.start()
+    thread = threading.Thread(target=run_server, daemon=True)
+    thread.start()
     print(f"✅ Health check server running on port {os.environ.get('PORT', 8080)}")
 
-    # ---- Bot Polling Thread ----
-    def run_bot():
-        global bot_is_alive
-        try:
-            init_db()
-            app = Application.builder().token(TOKEN).build()
-            app.add_handler(CommandHandler("start", start))
-            app.add_handler(CommandHandler("xlsx", xlsx_command))
-            app.add_handler(CommandHandler("preview", preview_command))
-            app.add_handler(CommandHandler("merge", merge_command))
-            app.add_handler(CommandHandler("append", append_command))
-            app.add_handler(CommandHandler("split", split_command))
-            app.add_handler(CommandHandler("search", search_command))
-            app.add_handler(CommandHandler("filter", filter_command))
-            app.add_handler(CommandHandler("stats", stats_command))
-            app.add_handler(CommandHandler("report", report_command))
-            app.add_handler(CommandHandler("clean", clean_command))
-            app.add_handler(CommandHandler("removeduplicate", removeduplicate_command))
-            app.add_handler(CommandHandler("sort", sort_command))
-            app.add_handler(CommandHandler("clear", clear_command))
-            app.add_handler(CommandHandler("admin", admin_command))
-            app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-            app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-            print("✅ Bot polling started. Waiting for messages...")
-            app.run_polling()
-            print("⚠️ Bot polling stopped unexpectedly.")
-            bot_is_alive = False
-            os._exit(1)
-
-        except Exception as e:
-            print(f"❌ Bot polling CRASHED: {e}")
-            bot_is_alive = False
-            os._exit(1)
-
-    bot_thread = threading.Thread(target=run_bot, daemon=False)
-    bot_thread.start()
-
-    # ---- Keep main thread alive ----
-    try:
-        while True:
-            time.sleep(10)
-            if not bot_thread.is_alive():
-                print("⚠️ Bot thread died! Setting health check to fail...")
-                bot_is_alive = False
-                os._exit(1)
-    except KeyboardInterrupt:
-        print("Shutting down...")
-        os._exit(0)
+    init_db()
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("xlsx", xlsx_command))
+    app.add_handler(CommandHandler("preview", preview_command))
+    app.add_handler(CommandHandler("merge", merge_command))
+    app.add_handler(CommandHandler("append", append_command))
+    app.add_handler(CommandHandler("split", split_command))
+    app.add_handler(CommandHandler("search", search_command))
+    app.add_handler(CommandHandler("filter", filter_command))
+    app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("report", report_command))
+    app.add_handler(CommandHandler("clean", clean_command))
+    app.add_handler(CommandHandler("removeduplicate", removeduplicate_command))
+    app.add_handler(CommandHandler("sort", sort_command))
+    app.add_handler(CommandHandler("clear", clear_command))
+    app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    print("✅ Bot is running with all features...")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
