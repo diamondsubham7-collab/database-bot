@@ -705,6 +705,7 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         df = pd.concat(dfs, ignore_index=True)
         if len(df) == 0:
             await update.message.reply_text("⚠️ No data found.")
+            return
         report_path = os.path.join("received_files", f"report_{update.effective_user.id}.xlsx")
         with pd.ExcelWriter(report_path, engine='openpyxl') as writer:
             overview_data = {
@@ -1017,7 +1018,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ AI Error: {str(e)}")
         print(f"AI Error: {e}")
 
-# ---------- MAIN (STABLE VERSION) ----------
+# ---------- MAIN (UPDATED WITH HEAD METHOD) ----------
 def main():
     # ---- Simple HTTP server for Render health check ----
     class HealthHandler(BaseHTTPRequestHandler):
@@ -1026,6 +1027,13 @@ def main():
             self.send_header('Content-type', 'text/plain')
             self.end_headers()
             self.wfile.write(b'OK')
+
+        # ---- FIX: Handle HEAD requests (UptimeRobot uses this) ----
+        def do_HEAD(self):
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+
         def log_message(self, format, *args):
             return  # Disable logs
 
